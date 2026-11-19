@@ -390,6 +390,41 @@
     return -1;
   }
 
+  // 读取 AVC slice header 的第一个语法元素 first_mb_in_slice（ue(v)）。
+  // 它是 slice header 的开头，语义为“本 slice 从画面第几个宏块开始”；
+  // 宏块地址在画面内唯一，所以 first_mb_in_slice === 0 当且仅当这是新画面的第一个 slice。
+  // 读取失败（截断、非法 start code、越界）返回 -1，调用方据此整文件回退旧逻辑。
+  function readFirstMb(n) {
+    var b = fileBytes;
+    if (!b || !n || n.offset < 0 || n.length <= 0) return -1;
+    var p = n.offset, end = Math.min(n.offset + n.length, b.length);
+    if (p + 4 > end) return -1;
+    while (p < end && b[p] === 0) p++;               // 00 00 [00] 01
+    if (p >= end || b[p] !== 1) return -1;
+    p += 2;                                          // 跳过 start code 的 0x01 与 1 字节 NAL header
+    var zeros = 0, buf = 0, cnt = 0;
+    function bit() {
+      while (cnt === 0) {
+        if (p >= end) throw 0;
+        var x = b[p++];
+        if (zeros >= 2 && x === 3) { zeros = 0; continue; }  // 防竞争字节 00 00 03
+        zeros = (x === 0) ? zeros + 1 : 0;
+        buf = x; cnt = 8;
+      }
+      cnt--;
+      return (buf >> cnt) & 1;
+    }
+    try {
+      var lead = 0;
+      while (bit() === 0) { if (++lead > 31) return -1; }
+      var suffix = 0;
+      for (var k = 0; k < lead; k++) suffix = suffix * 2 + bit();
+      return Math.pow(2, lead) - 1 + suffix;   // ue(v) = (2^lead - 1) + 尾码值
+    } catch (e) {
+      return -1;
+    }
+  }
+
   // 一次遍历完成：收集 slice、按帧分组、标注每个 NAL 的 frameIdx
   function computeFrames() {
     var nalus = currentData.nalus;
@@ -399,6 +434,22 @@
     for (var i = 0; i < nalus.length; i++) {
       if (nalus[i].sliceType >= 0) { hasFirstSlice = nalus[i].firstSlice !== undefined; break; }
     }
+    // AVC：先整条流试读 first_mb_in_slice。只要有一条读不出就整文件回退旧逻辑，
+    // 不做“一半新规则一半旧规则”的混用：截断流、坏首片只会回到今天的行为。
+    // 只对 wasm 给了 sliceType 的 NAL（type 1/5）尝试；type 20 coded slice extension
+    // 前面还有 24 bit 扩展头，读第一个 ue(v) 会读到垃圾值，必须排除。
+    var useFirstMb = false;
+    if (currentCodec === "avc" && !hasFirstSlice) {
+      var anySlice = false, allReadable = true;
+      for (var m = 0; m < nalus.length; m++) {
+        if (nalus[m].sliceType < 0) continue;
+        anySlice = true;
+        var fm = readFirstMb(nalus[m]);
+        if (fm < 0) { allReadable = false; break; }
+        nalus[m].firstMb = fm;
+      }
+      useFirstMb = anySlice && allReadable;
+    }
     var prevFrameNum = null;
     for (var j = 0; j < nalus.length; j++) {
       var n = nalus[j];
@@ -406,12 +457,15 @@
       var hasPoc = (n.slicePoc !== undefined && n.slicePoc !== null);
       var hasFn = (n.frameNum !== undefined && n.frameNum !== null);
       var poc = hasPoc ? n.slicePoc : frames.length;
-      slices.push({ index: j, type: n.sliceType, poc: poc, firstSlice: n.firstSlice });
+      slices.push({ index: j, type: n.sliceType, poc: poc, firstSlice: n.firstSlice, firstMb: n.firstMb });
       var si = slices.length - 1;
       var prev = frames.length > 0 ? frames[frames.length - 1] : null;
       var sameFrame = false;
       if (hasFirstSlice) {
         sameFrame = prev !== null && n.firstSlice === 0;
+      } else if (useFirstMb) {
+        // spec 级帧边界：first_mb_in_slice !== 0 表示仍是同一画面的后续 slice。
+        sameFrame = prev !== null && n.firstMb !== 0;
       } else if (hasPoc && hasFn) {
         // 帧边界同时看 POC 与 frame_num：pic_order_cnt_type=2 时解析器回填的 POC 恒为 0，
         // 只有 frame_num 能区分画面；两者都相同才算同一画面的多个 slice。
